@@ -4,8 +4,9 @@ on:
   push:
     branches: [main]
   schedule:
-    # 4 times a day (UTC). In Central time: about 9:40 PM, 3:40 AM, 9:40 AM and 3:40 PM in winter.
-    - cron: '42 3,9,15,21 * * *'
+    # Every hour at :17. Each check reads the models' run-time files first and only downloads
+    # (and republishes) when a new GFS/ECMWF run, ensemble or CPC outlook has landed.
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -20,6 +21,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.chk.outputs.deploy }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,9 +45,25 @@ jobs:
 
       - name: Pull the latest GFS/ECMWF runs, ensembles and CPC outlooks
         continue-on-error: true
+        env:
+          # scheduled checks download only what changed; a manual "Run workflow" refreshes everything
+          RUT_SMART: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          # optional: an Open-Meteo API key (repository secret) if the free per-address limit is ever hit
+          OPEN_METEO_KEY: ${{ secrets.OPEN_METEO_KEY }}
         run: python3 -I scripts/rut_updater.py new prev
 
+      - name: Anything new?
+        id: chk
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -f new/unchanged ]; then
+            echo "No new model runs or outlooks since $(cat new/unchanged); nothing to publish."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Assemble the site
+        if: steps.chk.outputs.deploy == 'true'
         run: |
           mkdir -p _site/feed
           cp index.html .nojekyll _site/
@@ -61,11 +80,13 @@ jobs:
           [ -f new/manifest.json ] && python3 -c "import json; m=json.load(open('new/manifest.json')); print('errors:', m['errors']); [print(k, v) for k, v in m['status'].items()]" || echo "updater produced nothing this run"
 
       - uses: actions/upload-pages-artifact@v3
+        if: steps.chk.outputs.deploy == 'true'
         with:
           path: _site
 
   deploy:
     needs: build
+    if: needs.build.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
