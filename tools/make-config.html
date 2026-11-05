@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rut Tracker config</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #121212; color: #e8e8e8; font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 6px; } p { color: #b5b5b5; }
+  label { display: block; margin: 16px 0 4px; font-weight: 600; }
+  input, textarea { width: 100%; box-sizing: border-box; background: #1f1f1f; color: #e8e8e8; border: 1px solid #3a3a3a; border-radius: 4px; padding: 8px; font: inherit; }
+  textarea { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; height: 140px; }
+  button { margin-top: 18px; background: #f28c28; color: #121212; border: 0; border-radius: 4px; padding: 9px 16px; font: inherit; font-weight: 700; cursor: pointer; }
+  .msg { margin-top: 10px; min-height: 1.5em; } .bad { color: #ff7b6b; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Make config.enc.json</h1>
+  <p>Encrypts the Google Sheet web-app address and key with the tracker password, so only people with the password can reach the Sheet. Nothing leaves this page. Save the result as <code>config.enc.json</code> in the top folder of the repository.</p>
+  <form id="f">
+    <label for="pw">Tracker password</label><input id="pw" type="text" value="Deer" autocomplete="off" required>
+    <label for="url">Apps Script web app URL (ends in /exec)</label><input id="url" type="url" placeholder="https://script.google.com/macros/s/.../exec" required>
+    <label for="key">KEY from the Apps Script log</label><input id="key" type="text" autocomplete="off" required>
+    <button type="submit">Make file</button>
+  </form>
+  <p class="msg" id="msg" role="status"></p>
+  <label for="out">config.enc.json</label><textarea id="out" readonly></textarea>
+</main>
+<script>
+const b64 = (u) => btoa(String.fromCharCode(...u));
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault(); const msg = document.getElementById('msg'); msg.className = 'msg';
+  const pw = document.getElementById('pw').value, sheetUrl = document.getElementById('url').value.trim(), key = document.getElementById('key').value.trim();
+  if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(sheetUrl)) { msg.className = 'msg bad'; msg.textContent = 'That doesn\'t look like a web app URL. It should start with https://script.google.com/macros/s/ and end with /exec.'; return; }
+  const enc = new TextEncoder(); const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12)), iter = 310000;
+  const base = await crypto.subtle.importKey('raw', enc.encode(pw.trim().toLowerCase()), 'PBKDF2', false, ['deriveKey']);
+  const k = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, enc.encode(JSON.stringify({ sheetUrl, key }))));
+  const json = JSON.stringify({ v: 1, iter, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+  document.getElementById('out').value = json;
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' })); a.download = 'config.enc.json'; a.click();
+  msg.textContent = 'Done. config.enc.json downloaded (also shown below). Upload it to the top folder of the repository.';
+});
+</script>
+</body>
+</html>
