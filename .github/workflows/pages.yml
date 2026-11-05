@@ -1,0 +1,75 @@
+name: Refresh weather and publish
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 4 times a day (UTC). In Central time: about 9:40 PM, 3:40 AM, 9:40 AM and 3:40 PM in winter.
+    - cron: '42 3,9,15,21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pyshp
+
+      - name: Get the feed that is live now (keeps the run-by-run history)
+        run: |
+          mkdir -p prev
+          for f in meta ens cpc hist g_gfs_t g_gfs_td g_gfs_ws g_gfs_wd g_gfs_wg g_gfs_p g_ecmwf_t g_ecmwf_td g_ecmwf_ws g_ecmwf_wd g_ecmwf_wg g_ecmwf_p; do
+            curl -fsSL "${{ steps.pages.outputs.base_url }}/feed/$f.json" -o "prev/$f.json" || rm -f "prev/$f.json"
+          done
+          ls prev
+
+      - name: Pull the latest GFS/ECMWF runs, ensembles and CPC outlooks
+        continue-on-error: true
+        run: python3 -I scripts/rut_updater.py new prev
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/feed
+          cp index.html .nojekyll _site/
+          [ -f config.enc.json ] && cp config.enc.json _site/ || echo "no config.enc.json yet: field reports stay in each browser"
+          cp feed/*.json _site/feed/ 2>/dev/null || true      # starter copy in the repo
+          cp prev/*.json _site/feed/ 2>/dev/null || true      # what was live
+          # use this run only if it got at least one model; otherwise keep what was live
+          if python3 -c "import json,sys; m=json.load(open('new/meta.json')); sys.exit(0 if (m.get('models') or m.get('ens')) else 1)" 2>/dev/null; then
+            cp new/*.json _site/feed/
+          else
+            echo "this run got no model data; keeping the live feed"
+          fi
+          rm -f _site/feed/manifest.json
+          [ -f new/manifest.json ] && python3 -c "import json; m=json.load(open('new/manifest.json')); print('errors:', m['errors']); [print(k, v) for k, v in m['status'].items()]" || echo "updater produced nothing this run"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
