@@ -37,7 +37,18 @@ UA = {'User-Agent': 'MissouriRutTracker/1.0 (scheduled refresh)'}
 errors, status = [], {}
 
 
+OM_KEY = os.environ.get('OPEN_METEO_KEY', '').strip()
+
+
+def keyed(url):
+    if not OM_KEY or 'open-meteo.com' not in url or '/v1/' not in url:
+        return url
+    url = url.replace('://api.open-meteo.com/', '://customer-api.open-meteo.com/').replace('://ensemble-api.open-meteo.com/', '://customer-ensemble-api.open-meteo.com/')
+    return url + ('&' if '?' in url else '?') + 'apikey=' + OM_KEY
+
+
 def get(url, timeout=120, binary=False):
+    url = keyed(url)
     if FIX:
         import hashlib
         name = hashlib.sha1(url.encode()).hexdigest()
@@ -52,6 +63,12 @@ def get(url, timeout=120, binary=False):
                 break
             except urllib.error.HTTPError as e:
                 if e.code < 500 and e.code != 429 or attempt == 2:
+                    try:
+                        why = json.loads(e.read().decode('utf-8', 'replace')).get('reason')
+                    except Exception:  # noqa: BLE001
+                        why = None
+                    if why:
+                        raise RuntimeError(f'HTTP {e.code}: {why}') from None
                     raise
                 time.sleep(10 * (attempt + 1))
             except Exception:  # noqa: BLE001
@@ -68,7 +85,25 @@ def r1(x, nd=1):
 # ---------------------------------------------------------------- deterministic grid
 VARS = ['temperature_2m', 'dew_point_2m', 'wind_speed_10m', 'wind_direction_10m', 'wind_gusts_10m', 'precipitation']
 KEY = {'temperature_2m': 't', 'dew_point_2m': 'td', 'wind_speed_10m': 'ws', 'wind_direction_10m': 'wd', 'wind_gusts_10m': 'wg', 'precipitation': 'p'}
-DMODELS = {'gfs': (['gfs_seamless', 'gfs_global', 'gfs025'], 16, 'ncep_gfs025'), 'ecmwf': (['ecmwf_ifs025', 'ecmwf_ifs'], 15, 'ecmwf_ifs025')}
+DMODELS = {'gfs': (['gfs_seamless', 'gfs_global', 'gfs025'], 16, ['ncep_gfs013', 'ncep_gfs025']), 'ecmwf': (['ecmwf_ifs025', 'ecmwf_ifs'], 15, ['ecmwf_ifs025', 'ecmwf_ifs'])}
+# run metadata (static files, not API calls): which run each source holds and when it finished arriving
+SOURCES = {'gfs': ('api', ['ncep_gfs013', 'ncep_gfs025']), 'ecmwf': ('api', ['ecmwf_ifs025', 'ecmwf_ifs']),
+           'ens_gfs': ('ensemble-api', ['ncep_gefs025', 'ncep_gefs05']), 'ens_ecmwf': ('ensemble-api', ['ecmwf_ifs025_ensemble'])}
+
+
+def run_meta(host, name):
+    try:
+        mj = json.loads(get(f'https://{host}.open-meteo.com/data/{name}/static/meta.json', 30))
+        return mj.get('last_run_initialisation_time'), mj.get('last_run_availability_time')
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def signature(src):
+    """[init, availability] for every file behind a source; changes whenever a new run (or the rest of one) lands"""
+    host, names = SOURCES[src]
+    return [list(run_meta(host, n)) for n in names]
+
 LATS = ','.join(f'{p[1]:.4f}' for p in PTS)
 LONS = ','.join(f'{p[0]:.4f}' for p in PTS)
 
@@ -106,6 +141,9 @@ def deterministic(key):
         while n > 0 and all((p['t'][n - 1] if n - 1 < len(p['t']) else None) is None for p in raw):
             n -= 1
         idx = [i for i in range(n) if tm[i] % 10800 == 0]
+        if len(idx) < 8:  # a run that is still arriving (or a refused request) can come back empty
+            last = f'{mid} returned no values'
+            continue
 
         def agg(p, i, k):
             arr_k = p[k]
@@ -119,11 +157,10 @@ def deterministic(key):
 
         pts = [{k: [agg(p, i, k) for i in idx] for k in KEY.values()} for p in raw]
         init = None
-        try:
-            mj = json.loads(get(f'https://api.open-meteo.com/data/{meta}/static/meta.json', 30))
-            init = mj.get('last_run_initialisation_time')
-        except Exception:  # noqa: BLE001
-            pass
+        for name in meta:  # first file that answers; for GFS the 0.13° file covers the first days
+            init = run_meta('api', name)[0]
+            if init:
+                break
         return {'id': mid, 'time': [tm[i] for i in idx], 'pts': pts, 'init': init}
     raise RuntimeError(f'{key}: {last}')
 
@@ -163,6 +200,9 @@ def ensemble(key):
         tm = arr[0]['hourly']['time']
         per = [{EK[v]: members(o['hourly'], v) for v in EVARS} for o in arr]
         mids = sorted(set.intersection(*[set(p['t'].keys()) for p in per])) if per else []
+        if not mids or not any(v is not None for p in per for m in mids for v in (p['t'].get(m) or [])):
+            last = f'{mid} ensemble returned no values'
+            continue
         series = []
         for m in mids:
             s = {}
@@ -426,11 +466,59 @@ def cpc_all():
 
 
 # ---------------------------------------------------------------- run
+def load_prev(name):
+    try:
+        return json.load(open(os.path.join(PREV, name + '.json'))) if PREV else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main():
     now = dt.datetime.now(dt.timezone.utc)
     docs = {}
     meta = {'at': now.isoformat(timespec='seconds'), 'pts': [[p[0], p[1]] for p in PTS], 'models': {}, 'ens': {}, 'step': 3, 'v': 1}
+    # SMART=1: check each source's run metadata first and download only what changed since the live feed
+    smart = os.environ.get('RUT_SMART') == '1'
+    pmeta, pens, pcpc = load_prev('meta') or {}, load_prev('ens') or {}, load_prev('cpc')
+    psig = pmeta.get('sig') or {}
+    sig, todo = {}, {'gfs', 'ecmwf', 'ens_gfs', 'ens_ecmwf', 'cpc'}
+    if smart and pmeta:
+        for src in SOURCES:
+            sig[src] = signature(src)
+            have = (src.startswith('ens') and (pens.get('models') or {}).get(src[4:])) or (not src.startswith('ens') and (pmeta.get('models') or {}).get(src))
+            if have and sig[src] == psig.get(src) and any(s[0] for s in sig[src]):
+                todo.discard(src)
+        try:
+            age = now - dt.datetime.fromisoformat(pcpc['at'])
+            if pcpc and pcpc.get('products') and age < dt.timedelta(hours=3):
+                todo.discard('cpc')
+        except Exception:  # noqa: BLE001
+            pass
+        if not todo:
+            print(json.dumps({'changed': False, 'note': 'no new model runs or outlooks since ' + str(pmeta.get('at'))}))
+            open(os.path.join(OUT, 'unchanged'), 'w').write(str(pmeta.get('at')))
+            return
+        # carry over what is not being refreshed
+        for k in ('gfs', 'ecmwf'):
+            if k not in todo and (pmeta.get('models') or {}).get(k):
+                meta['models'][k] = pmeta['models'][k]
+                status[k] = (pmeta.get('status') or {}).get(k, '') + ' (unchanged)'
+        for k in ('gfs', 'ecmwf'):
+            if 'ens_' + k not in todo and (pmeta.get('ens') or {}).get(k):
+                meta['ens'][k] = pmeta['ens'][k]
+                status['ens_' + k] = (pmeta.get('status') or {}).get('ens_' + k, '') + ' (unchanged)'
+        if 'cpc' not in todo:
+            for k, v in (pmeta.get('status') or {}).items():
+                if k.startswith('cpc_'):
+                    status[k] = v
+        print('refreshing:', sorted(todo))
+    else:
+        sig = {src: signature(src) for src in SOURCES}
+    meta['sig'] = {k: v for k, v in sig.items()}
+    failed = set()
     for key in ('gfs', 'ecmwf'):
+        if key not in todo:
+            continue
         try:
             m = deterministic(key)
             meta['models'][key] = {'id': m['id'], 'time': m['time'], 'init': m['init']}
@@ -438,19 +526,35 @@ def main():
                 docs[f'g_{key}_{k}'] = {'v': [p[k] for p in m['pts']]}
             status[key] = f"{m['id']} init {m['init']} {len(m['time'])} steps"
         except Exception as e:  # noqa: BLE001
+            failed.add(key)
             errors.append(str(e))
+    # a refresh that failed keeps the previous run instead of dropping that model from the page
+    for key in ('gfs', 'ecmwf'):
+        if key not in meta['models'] and (pmeta.get('models') or {}).get(key):
+            meta['models'][key] = pmeta['models'][key]
+            status[key] = 'kept previous run (refresh failed)'
     ens = {'at': meta['at'], 'models': {}}
     for key in ('gfs', 'ecmwf'):
+        if 'ens_' + key not in todo:
+            if (pens.get('models') or {}).get(key):
+                ens['models'][key] = pens['models'][key]
+            continue
         try:
             e = ensemble(key)
             ens['models'][key] = {'id': e['id'], 'members': e['members'], 'p': probs(e['members'])}
             meta['ens'][key] = {'id': e['id'], 'n': len(e['members'])}
             status['ens_' + key] = f"{e['id']} {len(e['members'])} members p={ens['models'][key]['p']}"
         except Exception as e:  # noqa: BLE001
+            failed.add('ens_' + key)
             errors.append(str(e))
+    for key in ('gfs', 'ecmwf'):
+        if key not in ens['models'] and (pens.get('models') or {}).get(key):
+            ens['models'][key] = pens['models'][key]
+            meta['ens'][key] = (pmeta.get('ens') or {}).get(key) or {'id': pens['models'][key].get('id'), 'n': len(pens['models'][key].get('members', []))}
+            status['ens_' + key] = 'kept previous run (refresh failed)'
     if ens['models']:
         docs['ens'] = ens
-    prods = cpc_all()
+    prods = cpc_all() if 'cpc' in todo else None
     if prods:
         docs['cpc'] = {'checked': now.date().isoformat(), 'at': meta['at'], 'products': prods}
     # history of warm-weekend chances by run
@@ -470,6 +574,8 @@ def main():
             hist['items'].append(item)
         hist['items'] = hist['items'][-90:]
         docs['hist'] = hist
+    for src in failed:  # not marked as current, so the next check tries again
+        meta['sig'].pop(src, None)
     meta['status'] = status
     meta['errors'] = errors
     docs['meta'] = meta
